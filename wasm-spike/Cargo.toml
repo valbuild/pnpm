@@ -4,6 +4,11 @@ version = "0.0.1"
 edition = "2024"
 publish = false
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
-pnpm-lockfile = { workspace = true }
-pnpm-resolving-deps-resolver = { workspace = true }
+pnpm-cli = { path = "../pnpm/crates/cli" }
+pnpm-wasm-host = { path = "../pnpm/crates/wasm-host" }
+miette = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync"] }

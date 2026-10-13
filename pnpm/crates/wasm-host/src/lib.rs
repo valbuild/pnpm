@@ -4,7 +4,7 @@
 //! is borrowed only during an import call, never while an operation is pending.
 
 #[cfg(target_family = "wasm")]
-pub use request::{HostError, Request, close_resource, request};
+pub use request::{HostError, Request, close_resource, notify_completion, request};
 
 #[cfg(target_family = "wasm")]
 mod bindings;

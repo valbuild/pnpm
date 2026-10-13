@@ -95,6 +95,26 @@ fn initialize_wasm_paths() -> std::io::Result<()> {
         })
 }
 
+/// Reactor entry for single-threaded wasm hosts: the same startup as [`run_cli`]
+/// minus shim dispatch, pinned-pnpm switching, big-stack threads and the
+/// tokio runtime. The caller polls the returned future from its own executor.
+#[cfg(target_family = "wasm")]
+pub async fn run_async(argv: Vec<OsString>) -> miette::Result<()> {
+    initialize_wasm_paths().map_err(|error| miette::miette!("{error}"))?;
+    enable_tracing_by_env();
+    install_report_handler();
+    set_panic_hook();
+    let (config_overrides, argv) = ConfigOverrides::extract(argv);
+    pnpm_default_reporter::set_package_version(pnpm_config::PNPM_VERSION);
+    let (command, argv) = prepare_cli_argv(argv);
+    let mut args = match parse_cli_args(command, argv) {
+        Ok(args) => args,
+        Err(error) => return Err(miette::miette!("{error}")),
+    };
+    configure_cli_args(&mut args)?;
+    args.run(&config_overrides, false).await
+}
+
 fn report_fatal_error(error: &miette::Report) {
     for cause in error.chain() {
         if let Some(pnpm_package_manager::InstallError::PeerDependencyIssues { rendered }) =

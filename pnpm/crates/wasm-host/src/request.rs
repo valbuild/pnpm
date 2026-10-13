@@ -157,6 +157,26 @@ struct Response {
     error: Option<HostError>,
 }
 
+/// Single-threaded builds have no pump thread: the host calls
+/// [`notify_completion`] (through the guest's exported `complete`) instead.
+#[cfg(not(target_feature = "atomics"))]
+fn ensure_completion_pump() -> Result<(), HostError> {
+    Ok(())
+}
+
+/// Wakes the future waiting on host operation `identifier`.
+pub fn notify_completion(identifier: u32) {
+    let waker = REQUESTS
+        .lock()
+        .expect("host request registry poisoned")
+        .as_ref()
+        .and_then(|requests| requests.get(&identifier).map(Arc::clone));
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+#[cfg(target_feature = "atomics")]
 fn ensure_completion_pump() -> Result<(), HostError> {
     COMPLETION_PUMP
         .get_or_init(|| {
