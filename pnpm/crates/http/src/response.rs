@@ -84,11 +84,17 @@ impl Response {
         #[derive(serde::Deserialize)]
         struct Chunk {
             done: bool,
-            bytes: Vec<u8>,
+            // base64: a JSON number array costs ~3.5x the bytes and a slow parse on both sides.
+            bytes: String,
         }
         let chunk: Chunk = serde_json::from_value(value)
             .map_err(|error| Error::new(Kind::Decode, error.to_string()))?;
-        Ok((!chunk.done).then(|| Bytes::from(chunk.bytes)))
+        if chunk.done {
+            return Ok(None);
+        }
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chunk.bytes)
+            .map_err(|error| Error::new(Kind::Decode, error.to_string()))?;
+        Ok(Some(Bytes::from(bytes)))
     }
     pub async fn bytes(mut self) -> Result<Bytes> {
         let mut bytes = Vec::new();
