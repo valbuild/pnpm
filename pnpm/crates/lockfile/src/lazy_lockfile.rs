@@ -80,6 +80,10 @@ impl LazyLockfile {
         if self.cell.get().is_some() {
             return;
         }
+        // Single-threaded wasm cannot spawn: `load` reads the file on first use instead.
+        if cfg!(target_family = "wasm") {
+            return;
+        }
         let Some((dir, selection)) = self.source.clone() else { return };
         let mut slot = match self.prefetch.lock() {
             Ok(slot) => slot,
