@@ -154,6 +154,53 @@ pub fn shared_picked_manifest_cache() -> PickedManifestCache {
 #[derive(Debug, Default)]
 pub struct InMemoryPackageMetaCache {
     pub(super) inner: DashMap<String, CachedPackument>,
+    /// wasm only: insertion order and estimated sizes, so the cache can stay under a byte budget
+    /// (`PNPM_WASM_META_CACHE_MB`). An evicted packument is fetched again through the host's HTTP cache.
+    #[cfg(target_family = "wasm")]
+    budget: std::sync::Mutex<WasmBudget>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Debug, Default)]
+struct WasmBudget {
+    order: std::collections::VecDeque<(String, usize)>,
+    bytes: usize,
+}
+
+/// Rough in-memory size of a parsed packument: what matters is how many versions it holds.
+#[cfg(target_family = "wasm")]
+fn estimated_size(meta: &Package) -> usize {
+    1024 + meta.versions.len() * 900 + meta.time.as_ref().map_or(0, |t| t.len() * 120)
+}
+
+#[cfg(target_family = "wasm")]
+fn wasm_budget_bytes() -> Option<usize> {
+    static BUDGET: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("PNPM_WASM_META_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb * 1024 * 1024)
+    })
+}
+
+impl InMemoryPackageMetaCache {
+    fn put(&self, key: String, entry: CachedPackument) {
+        #[cfg(target_family = "wasm")]
+        if let Some(limit) = wasm_budget_bytes() {
+            let size = estimated_size(&entry.meta);
+            let mut budget = self.budget.lock().unwrap();
+            budget.order.push_back((key.clone(), size));
+            budget.bytes += size;
+            // drop the oldest entries, never the one just added
+            while budget.bytes > limit && budget.order.len() > 1 {
+                if let Some((old, old_size)) = budget.order.pop_front() {
+                    budget.bytes = budget.bytes.saturating_sub(old_size);
+                    if old != key {
+                        self.inner.remove(&old);
+                    }
+                }
+            }
+        }
+        self.inner.insert(key, entry);
+    }
 }
 
 impl PackageMetaCache for InMemoryPackageMetaCache {
@@ -164,11 +211,11 @@ impl PackageMetaCache for InMemoryPackageMetaCache {
     }
 
     fn set(&self, key: String, meta: Arc<Package>) {
-        self.inner.insert(key, CachedPackument { meta, registry_verified: true });
+        self.put(key, CachedPackument { meta, registry_verified: true });
     }
 
     fn set_unverified(&self, key: String, meta: Arc<Package>) {
-        self.inner.insert(key, CachedPackument { meta, registry_verified: false });
+        self.put(key, CachedPackument { meta, registry_verified: false });
     }
 }
 
