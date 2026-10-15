@@ -115,6 +115,31 @@ pub async fn run_async(argv: Vec<OsString>) -> miette::Result<()> {
     args.run(&config_overrides, false).await
 }
 
+/// One-time process setup for a host that runs commands in-process (a server), where [`main`] does not run.
+#[cfg(not(target_family = "wasm"))]
+pub fn init_in_process_host() {
+    enable_tracing_by_env();
+    install_report_handler();
+    set_panic_hook();
+    configure_rayon_pool();
+}
+
+/// Run one command line in this process, as [`main`] would, minus the process-wide steps: no shim dispatch, no pinned-pnpm
+/// switching, no `exit`. The command's directory comes from `-C`/`--dir` in `argv` (the process cwd is never read or changed),
+/// so concurrent calls with different directories do not interfere. Call [`init_in_process_host`] once first.
+#[cfg(not(target_family = "wasm"))]
+pub async fn run_in_process(argv: Vec<OsString>) -> miette::Result<()> {
+    let (config_overrides, argv) = ConfigOverrides::extract(argv);
+    pnpm_default_reporter::set_package_version(pnpm_config::PNPM_VERSION);
+    let (command, argv) = prepare_cli_argv(argv);
+    let mut args = match parse_cli_args(command, argv) {
+        Ok(args) => args,
+        Err(error) => return Err(miette::miette!("{error}")),
+    };
+    configure_cli_args(&mut args)?;
+    args.run(&config_overrides, false).await
+}
+
 fn report_fatal_error(error: &miette::Report) {
     for cause in error.chain() {
         if let Some(pnpm_package_manager::InstallError::PeerDependencyIssues { rendered }) =

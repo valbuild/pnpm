@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pnpm/crates/*", "pnpm/tasks/*", "pnpr/crates/*", "wasm-spike"]
+members = ["pnpm/crates/*", "pnpm/tasks/*", "pnpr/crates/*", "wasm-spike", "anotherdep-server"]
 exclude = ["vendor/tar"]
 
 [workspace.package]
@@ -387,6 +387,13 @@ debug = true
 # panic that unwinds to the FFI boundary. napi-rs catches unwinding panics
 # and turns them into JS exceptions, so the addon must be built with
 # `panic = "unwind"` instead.
+# The server must survive a panic in one request, so unlike `release` it unwinds.
+[profile.server]
+inherits = "release"
+panic = "unwind"
+lto = "thin"
+codegen-units = 16
+
 [profile.napi-release]
 inherits = "release"
 panic = "unwind"
