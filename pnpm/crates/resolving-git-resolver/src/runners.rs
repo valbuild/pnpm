@@ -124,6 +124,16 @@ impl GitCommandRunner for RealGitRunner {
         let ref_owned = ref_.map(str::to_string);
         let connect_guard = self.connect_guard.clone();
         Box::pin(async move {
+            // An `https` remote is listed over the smart-HTTP protocol, in process: no `git` binary, no child process. Anything that
+            // does not work that way (another transport, a login prompt, an answer that is not a ref advertisement) goes to `git`.
+            if repo_owned.starts_with("https://") && std::env::var_os("PNPM_GIT_LS_REMOTE_CLI").is_none() {
+                match ls_remote_http(&repo_owned, ref_owned.as_deref()).await {
+                    Ok(listing) => return Ok(listing),
+                    // the host said no (no such repository, or one that needs a login): `git` would be told the same
+                    Err(HttpListing::Refused(message)) => return Err(GitRunError { message }),
+                    Err(HttpListing::Other(_)) => {}
+                }
+            }
             let config = match connect_guard {
                 Some(guard) => pinned_git_config(&repo_owned, guard).await?,
                 None => Vec::new(),
@@ -135,6 +145,88 @@ impl GitCommandRunner for RealGitRunner {
             .map_err(|err| GitRunError { message: format!("ls-remote task panicked: {err}") })?
         })
     }
+}
+
+/// `git ls-remote <repo> [<ref>]` over the smart-HTTP protocol: `GET <repo>/info/refs?service=git-upload-pack` answers with a
+/// pkt-line advertisement of every ref (peeled tags as `<tag>^{}`), which is `ls-remote`'s output in another encoding.
+enum HttpListing {
+    /// the host answered 401, 403 or 404
+    Refused(String),
+    /// anything else: the `git` binary gets to try
+    Other(String),
+}
+
+async fn ls_remote_http(repo: &str, ref_: Option<&str>) -> Result<String, HttpListing> {
+    let other = |e: String| HttpListing::Other(e);
+    let url = format!("{}/info/refs?service=git-upload-pack", repo.trim_end_matches('/'));
+    let origin = reqwest::Url::parse(&url).map_err(|e| other(e.to_string()))?;
+    let host = origin.host_str().map(str::to_string);
+    // redirects stay on the host the specifier named (GitHub sends `repo` to `repo.git`)
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 4 || attempt.url().host_str().map(str::to_string) != host {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    });
+    let client = reqwest::Client::builder().redirect(policy).timeout(Duration::from_secs(30)).user_agent("git/2.43.0").build().map_err(|e| other(e.to_string()))?;
+    let response = client.get(url).header("accept", "*/*").send().await.map_err(|e| other(e.to_string()))?;
+    if matches!(response.status().as_u16(), 401 | 403 | 404) {
+        return Err(HttpListing::Refused(format!("repository not found or not public (HTTP {})", response.status().as_u16())));
+    }
+    if !response.status().is_success() {
+        return Err(other(format!("status {}", response.status())));
+    }
+    let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    if content_type != "application/x-git-upload-pack-advertisement" {
+        return Err(other(format!("not a ref advertisement ({content_type})")));
+    }
+    let body = response.bytes().await.map_err(|e| other(e.to_string()))?;
+    parse_advertisement(&body, ref_).map_err(other)
+}
+
+/// pkt-lines: four hex digits of length (counting themselves), `0000` is a flush. The first line names the service; after the flush each
+/// line is `<sha> <ref>` (the first with `\0capabilities` after the ref).
+fn parse_advertisement(body: &[u8], ref_: Option<&str>) -> Result<String, String> {
+    let mut at = 0;
+    let mut out = String::new();
+    let mut saw_service = false;
+    while at + 4 <= body.len() {
+        let len = usize::from_str_radix(std::str::from_utf8(&body[at..at + 4]).map_err(|e| e.to_string())?, 16).map_err(|e| e.to_string())?;
+        if len == 0 {
+            at += 4;
+            continue;
+        }
+        if len < 4 || at + len > body.len() {
+            return Err("truncated pkt-line".into());
+        }
+        let line = String::from_utf8_lossy(&body[at + 4..at + len]);
+        at += len;
+        let line = line.trim_end_matches('\n');
+        if let Some(service) = line.strip_prefix("# service=") {
+            saw_service = service == "git-upload-pack";
+            continue;
+        }
+        let line = line.split('\0').next().unwrap_or_default();
+        let Some((sha, name)) = line.split_once(' ') else { continue };
+        if sha.len() < 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if let Some(wanted) = ref_ {
+            let bare = name.strip_suffix("^{}").unwrap_or(name);
+            if bare != wanted && !bare.ends_with(&format!("/{wanted}")) {
+                continue;
+            }
+        }
+        out.push_str(sha);
+        out.push('\t');
+        out.push_str(name);
+        out.push('\n');
+    }
+    if !saw_service {
+        return Err("no service line".into());
+    }
+    Ok(out)
 }
 
 fn run_ls_remote_blocking(
@@ -199,3 +291,36 @@ fn ls_remote_command(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod advertisement_tests {
+    use super::parse_advertisement;
+
+    fn pkt(text: &str) -> Vec<u8> {
+        format!("{:04x}{text}", text.len() + 4).into_bytes()
+    }
+
+    #[test]
+    fn a_ref_advertisement_reads_like_ls_remote() {
+        let sha = |c: char| c.to_string().repeat(40);
+        let mut body = pkt("# service=git-upload-pack\n");
+        body.extend(b"0000");
+        body.extend(pkt(&format!("{} HEAD\0multi_ack symref=HEAD:refs/heads/main\n", sha('a'))));
+        body.extend(pkt(&format!("{} refs/heads/main\n", sha('a'))));
+        body.extend(pkt(&format!("{} refs/tags/1.0.0\n", sha('b'))));
+        body.extend(pkt(&format!("{} refs/tags/1.0.0^{{}}\n", sha('c'))));
+        body.extend(b"0000");
+        let all = parse_advertisement(&body, None).unwrap();
+        assert_eq!(all, format!("{}\tHEAD\n{}\trefs/heads/main\n{}\trefs/tags/1.0.0\n{}\trefs/tags/1.0.0^{{}}\n", sha('a'), sha('a'), sha('b'), sha('c')));
+        // a ref asks for that ref and its peeled form, wherever it lives
+        let tag = parse_advertisement(&body, Some("1.0.0")).unwrap();
+        assert_eq!(tag, format!("{}\trefs/tags/1.0.0\n{}\trefs/tags/1.0.0^{{}}\n", sha('b'), sha('c')));
+        assert_eq!(parse_advertisement(&body, Some("nope")).unwrap(), "");
+    }
+
+    #[test]
+    fn something_that_is_not_an_advertisement_is_an_error() {
+        assert!(parse_advertisement(b"<html>login</html>", None).is_err());
+        assert!(parse_advertisement(b"0009hello", None).is_err());
+    }
+}
