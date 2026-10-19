@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pnpm/crates/*", "pnpm/tasks/*", "pnpr/crates/*", "wasm-spike", "anotherdep-server"]
+members = ["pnpm/crates/*", "pnpm/tasks/*", "pnpr/crates/*", "wasm-spike"]
 exclude = ["vendor/tar"]
 
 [workspace.package]
