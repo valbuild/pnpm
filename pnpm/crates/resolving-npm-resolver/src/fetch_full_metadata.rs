@@ -1,0 +1,449 @@
+//! No-cache metadata fetcher.
+//!
+//! Issues a GET against `<registry>/<package>`. The `full_metadata`
+//! flag picks between the **full** packument
+//! (`Accept: application/json; q=1.0, */*`) and the **abbreviated**
+//! install-v1 form
+//! (`Accept: application/vnd.npm.install-v1+json; q=1.0,
+//! application/json; q=0.8, */*`). The two forms are byte-different:
+//! the abbreviated document drops the per-version `time` map,
+//! `_npmUser`, and `dist.attestations`, which are exactly the fields
+//! the `minimumReleaseAge` and `trustPolicy='no-downgrade'` checks
+//! read.
+//!
+//! Callers that need maturity / trust evidence (the verifier and the
+//! resolver's upgrade-on-recent-modified path) must request full
+//! metadata. The resolver's default install path requests
+//! abbreviated and upgrades to full only when the maturity check
+//! demands it.
+
+use pnpm_network::{
+    AuthHeaders, RetryOpts, ThrottledClient, ThrottledClientGuard, read_self_delimiting_text,
+    redact_url_credentials, redact_url_for_display, retry_async, send_with_retry_at_priority,
+};
+use pnpm_registry::Package;
+use reqwest::{Response, StatusCode, header};
+use std::time::{Duration, Instant};
+
+use crate::{FetchMetadataError, mirror::clear_meta, registry_url::to_registry_url};
+
+/// Accept header for the full packument.
+pub(crate) const ACCEPT_FULL_DOC: &str = "application/json; q=1.0, */*";
+
+/// Accept header for the abbreviated `install-v1` packument.
+pub(crate) const ACCEPT_ABBREVIATED_DOC: &str =
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+
+/// Content type of an abbreviated (install-oriented) packument. A
+/// spec-compliant registry echoes this in the response `Content-Type` when it
+/// honors the abbreviated `Accept` header. Its absence signals that the
+/// registry ignored the header and served the full document instead.
+/// <https://github.com/npm/registry/blob/ae49abf1ba/docs/responses/package-metadata.md>
+const ABBREVIATED_META_CONTENT_TYPE: &str = "application/vnd.npm.install-v1+json";
+
+/// `true` when `Cache-Control` says the metadata document is already stale.
+///
+/// `max-age=0`, `no-cache`, and `no-store` are the signals a registry uses
+/// when a later publish must not be hidden behind the previous document.
+/// A positive `max-age` stays cacheable and keeps conditional requests.
+pub(crate) fn metadata_response_is_uncacheable(headers: &header::HeaderMap) -> bool {
+    // `get` returns only the first field. A registry can send
+    // `Cache-Control: public` and `Cache-Control: no-cache` as two
+    // fields; any one of them forbidding reuse wins.
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(cache_control_value_is_uncacheable)
+}
+
+fn cache_control_value_is_uncacheable(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|directive| {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("no-cache")
+                || directive.eq_ignore_ascii_case("no-store")
+            {
+                return true;
+            }
+            let Some((name, age)) = directive.split_once('=') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("max-age") && age.trim().parse::<u64>().ok() == Some(0)
+        })
+}
+
+/// Whether the response `Content-Type` declares the abbreviated packument
+/// media type. Parameters (`; charset=utf-8`) are dropped and the comparison
+/// is case-insensitive (RFC 9110 §8.3.1).
+pub(crate) fn is_abbreviated_content_type(headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let media_type = value.split_once(';').map_or(value, |(media_type, _)| media_type);
+            media_type.trim().eq_ignore_ascii_case(ABBREVIATED_META_CONTENT_TYPE)
+        })
+}
+
+/// Options bundle for [`fetch_full_metadata`]. The cached variant
+/// ([`crate::FetchFullMetadataCachedOptions`]) layers a
+/// cache-directory field on top of these.
+#[derive(Debug, Clone)]
+pub struct FetchFullMetadataOptions<'a> {
+    pub registry: &'a str,
+    /// `true` requests the full packument (with `time`, `_npmUser`,
+    /// and `dist.attestations`); `false` requests the abbreviated
+    /// `install-v1` form.
+    pub full_metadata: bool,
+    /// Optional `If-None-Match` header value. When `Some`, the
+    /// registry can answer the request with `304 Not Modified` and
+    /// the fetcher returns [`FetchFullMetadataOutcome::NotModified`]
+    /// instead of a body.
+    pub etag: Option<&'a str>,
+    /// Optional `If-Modified-Since` header value. Same role as
+    /// [`Self::etag`] — gives the registry a chance to short-circuit
+    /// the body re-download.
+    pub modified: Option<&'a str>,
+    pub http: crate::MetadataHttpClient<'a>,
+}
+
+/// Outcome of a [`fetch_full_metadata`] call. The caller reacts
+/// differently to a 304 than to a 200. [`Package`] is boxed so the
+/// size of the enum stays small even though a full packument can be
+/// many KB.
+#[derive(Debug, Clone)]
+pub enum FetchFullMetadataOutcome {
+    /// Registry returned a 2xx with a parsed body.
+    Modified(Box<Package>),
+    /// Registry returned `304 Not Modified` because the conditional
+    /// headers matched. Callers keep the meta they already have.
+    NotModified,
+}
+
+pub(crate) struct MetadataRequestOptions<'a> {
+    pub pkg_name: &'a str,
+    pub url: &'a str,
+    pub accept: &'a str,
+    /// Network-permit class of the request:
+    /// [`pnpm_network::UNPRIORITIZED`] for fetches that gate
+    /// resolution progress, [`pnpm_network::BACKGROUND`] for the
+    /// lockfile-verification fan-out.
+    pub priority: u64,
+    pub etag: Option<&'a str>,
+    pub modified: Option<&'a str>,
+    /// Send `Cache-Control: no-cache`, so an intermediary cannot answer from
+    /// its own copy without asking the origin. With [`Self::etag`] or
+    /// [`Self::modified`] the origin still answers a current mirror with a
+    /// `304`. Without them only a body can satisfy the request.
+    pub bypass_cache: bool,
+    pub http: crate::MetadataHttpClient<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MetadataHttpClient<'a> {
+    pub http_client: &'a ThrottledClient,
+    pub auth_headers: &'a AuthHeaders,
+    pub retry_opts: RetryOpts,
+}
+
+impl MetadataHttpClient<'_> {
+    /// One HTTP attempt. [`crate::FetchMetadataError::is_transient`]
+    /// owns the caller's retry budget around the whole fetch, so the
+    /// inner send must not spend it again.
+    pub(crate) fn one_attempt(self) -> Self {
+        Self { retry_opts: RetryOpts { retries: 0, ..self.retry_opts }, ..self }
+    }
+}
+
+/// Send a metadata GET, retrying an unsolicited 304 once with intermediary
+/// cache reuse disabled. A repeated 304 cannot validate any local body and is
+/// reported with the same error in both pnpm implementations.
+///
+/// A validator-free [`MetadataRequestOptions::bypass_cache`] request already
+/// disabled intermediary reuse, so that retry would only repeat itself: its
+/// 304 fails straight away instead.
+///
+/// A 304 to a revalidation sent without `bypass_cache` whose `Cache-Control`
+/// forbids reuse (see [`metadata_response_is_uncacheable`]) is asked once
+/// more without validators. Only a mirror without the uncacheable flag sends
+/// such a revalidation, and a stale intermediary can answer it with a 304. If
+/// the validator-free request is answered with a 304 too, it is returned as
+/// is and the caller serves its mirror.
+pub(crate) async fn send_metadata_request<'a>(
+    opts: &MetadataRequestOptions<'a>,
+) -> Result<(ThrottledClientGuard<'a>, Response), FetchMetadataError> {
+    // The route policy decides whether this origin may be reached at all,
+    // here rather than when the request that named it was read: a registry a
+    // caller configures but never resolves from costs nothing.
+    if !opts.http.auth_headers.allows_fetch(opts.url) {
+        return Err(FetchMetadataError::OffAllowlist { url: redact_url_credentials(opts.url) });
+    }
+    let validators = Validators::for_request(opts);
+    let (client, response) = send_once(opts, &validators, opts.bypass_cache).await?;
+    if response.status() != StatusCode::NOT_MODIFIED {
+        return Ok((client, response));
+    }
+    if validators.any() {
+        if opts.bypass_cache || !metadata_response_is_uncacheable(response.headers()) {
+            return Ok((client, response));
+        }
+        drop(client);
+        return send_once(opts, &Validators::NONE, true).await;
+    }
+    drop(client);
+    if opts.bypass_cache {
+        return Err(FetchMetadataError::NotModifiedWithoutCache {
+            pkg_name: opts.pkg_name.to_string(),
+        });
+    }
+
+    let (client, response) = send_once(opts, &validators, true).await?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        drop(client);
+        return Err(FetchMetadataError::NotModifiedWithoutCache {
+            pkg_name: opts.pkg_name.to_string(),
+        });
+    }
+    Ok((client, response))
+}
+
+/// The conditional-request headers this call may send.
+struct Validators<'a> {
+    etag: Option<&'a str>,
+    modified: Option<String>,
+}
+
+impl<'a> Validators<'a> {
+    const NONE: Validators<'static> = Validators { etag: None, modified: None };
+
+    fn for_request(opts: &MetadataRequestOptions<'a>) -> Self {
+        Validators {
+            etag: opts.etag.filter(|value| !value.is_empty()),
+            modified: opts.modified
+                .filter(|value| !value.is_empty())
+                .and_then(to_http_date),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.etag.is_some() || self.modified.is_some()
+    }
+}
+
+async fn send_once<'a>(
+    opts: &MetadataRequestOptions<'a>,
+    validators: &Validators<'_>,
+    bypass_cache: bool,
+) -> Result<(ThrottledClientGuard<'a>, Response), FetchMetadataError> {
+    send_with_retry_at_priority(
+        opts.http.http_client,
+        opts.url,
+        opts.priority,
+        opts.http.retry_opts,
+        |client| {
+            let mut request = client.get(opts.url).header(header::ACCEPT, opts.accept);
+            if let Some(value) =
+                opts.http.auth_headers.for_url_with_package(opts.url, Some(opts.pkg_name))
+            {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            if let Some(etag) = validators.etag {
+                request = request.header(header::IF_NONE_MATCH, etag);
+            }
+            if let Some(modified) = validators.modified.as_deref() {
+                request = request.header(header::IF_MODIFIED_SINCE, modified);
+            }
+            if bypass_cache {
+                request = request.header(header::CACHE_CONTROL, "no-cache");
+            }
+            request
+        },
+    )
+    .await
+    .map_err(|error| FetchMetadataError::Network {
+        url: redact_url_credentials(opts.url),
+        error: error.without_url(),
+    })
+}
+
+/// Convert a stored `modified` value — the packument's ISO-8601
+/// `time.modified` — to the HTTP-date form `If-Modified-Since` requires
+/// (RFC 9110 §8.8.3), the same conversion the TypeScript CLI applies with
+/// `toUTCString()`. A value already in HTTP-date form is kept. `None` when
+/// the value parses as neither, so it is dropped instead of sent — a
+/// recipient must ignore a malformed `If-Modified-Since` anyway.
+fn to_http_date(value: &str) -> Option<String> {
+    if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(httpdate::fmt_http_date(datetime.into()));
+    }
+    httpdate::parse_http_date(value).ok().map(httpdate::fmt_http_date)
+}
+
+/// A metadata document plus the response's entity tag and whether it
+/// forbade caching.
+pub(crate) struct MetadataDocument {
+    pub outcome: FetchFullMetadataOutcome,
+    pub etag: Option<String>,
+    pub uncacheable: bool,
+}
+
+/// Fetch the registry metadata document for `pkg_name`. The
+/// `full_metadata` flag on [`FetchFullMetadataOptions`] picks
+/// between the full and abbreviated packument forms.
+pub async fn fetch_full_metadata(
+    pkg_name: &str,
+    opts: &FetchFullMetadataOptions<'_>,
+) -> Result<FetchFullMetadataOutcome, FetchMetadataError> {
+    Ok(fetch_metadata_document(pkg_name, opts).await?.outcome)
+}
+
+pub(crate) async fn fetch_metadata_document(
+    pkg_name: &str,
+    opts: &FetchFullMetadataOptions<'_>,
+) -> Result<MetadataDocument, FetchMetadataError> {
+    let url = to_registry_url(opts.registry, pkg_name);
+    let accept = if opts.full_metadata { ACCEPT_FULL_DOC } else { ACCEPT_ABBREVIATED_DOC };
+    retry_async(&url, opts.http.retry_opts, FetchMetadataError::is_transient, || {
+        one_metadata_attempt(pkg_name, opts, &url, accept)
+    })
+    .await
+}
+
+async fn one_metadata_attempt(
+    pkg_name: &str,
+    opts: &FetchFullMetadataOptions<'_>,
+    url: &str,
+    accept: &str,
+) -> Result<MetadataDocument, FetchMetadataError> {
+    let (client, response) = send_metadata_request(&MetadataRequestOptions {
+        pkg_name,
+        url,
+        accept,
+        priority: pnpm_network::UNPRIORITIZED,
+        etag: opts.etag,
+        modified: opts.modified,
+        bypass_cache: false,
+        http: opts.http.one_attempt(),
+    })
+    .await?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        return Ok(MetadataDocument {
+            outcome: FetchFullMetadataOutcome::NotModified,
+            etag: None,
+            uncacheable: false,
+        });
+    }
+    let started_at = client.acquired_at();
+    document_from_response(client, response, opts, url, started_at).await
+}
+
+async fn document_from_response(
+    client: pnpm_network::ThrottledClientGuard<'_>,
+    response: reqwest::Response,
+    opts: &FetchFullMetadataOptions<'_>,
+    url: &str,
+    started_at: Instant,
+) -> Result<MetadataDocument, FetchMetadataError> {
+    let uncacheable = metadata_response_is_uncacheable(response.headers());
+    let etag = response_etag(&response);
+    let response = response
+        .error_for_status()
+        .map_err(|error| FetchMetadataError::Network {
+            url: redact_url_credentials(url),
+            error: error.without_url(),
+        })?;
+    let normalize_to_abbreviated =
+        !opts.full_metadata && !is_abbreviated_content_type(response.headers());
+    let raw_body = read_self_delimiting_text(response).await
+        .inspect_err(|error| opts.http.http_client.downscale_on_timeout(url, error))
+        .map_err(|error| FetchMetadataError::BodyRead {
+            url: redact_url_credentials(url),
+            error: error.without_url(),
+        })?;
+    // Body fully buffered — release the connection and its
+    // network-concurrency permit, then parse off the reactor.
+    drop(client);
+    let (meta, elapsed) =
+        decode_full_metadata(url, raw_body, normalize_to_abbreviated, started_at).await?;
+    warn_if_request_is_slow(opts.http.http_client, elapsed, url);
+    Ok(MetadataDocument {
+        outcome: FetchFullMetadataOutcome::Modified(Box::new(meta)),
+        etag,
+        uncacheable,
+    })
+}
+
+pub(crate) fn response_etag(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+pub(crate) fn warn_if_request_is_slow(http_client: &ThrottledClient, elapsed: Duration, url: &str) {
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed_ms > http_client.fetch_warn_timeout().as_millis() {
+        http_client.warn(&format!("Request took {elapsed_ms}ms: {}", redact_url_for_display(url)));
+    }
+}
+
+/// Strip a packument served for an **abbreviated** request down to the
+/// abbreviated field set, for a registry that ignored the `Accept` header
+/// (detected via [`is_abbreviated_content_type`]) and returned the full
+/// document. Neither the in-memory pick nor the on-disk mirror then carries
+/// the install-irrelevant data (scripts, exports, readme, custom fields) a
+/// full document contains. Registries that honor the header (e.g. the npm
+/// registry) echo the abbreviated `Content-Type` and skip this entirely.
+///
+/// Normalization is a cache optimization, not a correctness requirement, so
+/// the practically-unreachable [`clear_meta`] failure (a fragment that was
+/// parsed from the response body failing to re-parse) keeps the full
+/// document rather than failing the fetch.
+pub(crate) fn normalize_abbreviated_meta(meta: Package) -> Package {
+    match clear_meta(&meta) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            tracing::warn!(
+                target: "pnpm_resolving_npm_resolver",
+                %error,
+                "could not normalize a non-abbreviated metadata response; keeping the full document",
+            );
+            meta
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Parse a buffered packument off the reactor after releasing the network permit.
+async fn decode_full_metadata(
+    url: &str,
+    raw_body: String,
+    normalize_to_abbreviated: bool,
+    started_at: Instant,
+) -> Result<(Package, Duration), FetchMetadataError> {
+    let task_url = url.to_string();
+    let (meta, elapsed) =
+        tokio::task::spawn_blocking(move || -> Result<(Package, Duration), FetchMetadataError> {
+            let mut meta = serde_json::from_str::<Package>(&raw_body)
+                .map_err(|error| FetchMetadataError::Decode {
+                    url: redact_url_credentials(&task_url),
+                    error,
+                })?;
+            meta.drop_incomplete_publish_times();
+            let elapsed = started_at.elapsed();
+            let meta =
+                if normalize_to_abbreviated { normalize_abbreviated_meta(meta) } else { meta };
+            Ok((meta, elapsed))
+        })
+        .await
+        .map_err(|error| FetchMetadataError::ParseTask {
+            url: redact_url_credentials(url),
+            error,
+        })??;
+    Ok((meta, elapsed))
+}

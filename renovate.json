@@ -1,0 +1,130 @@
+{
+  "extends": [
+    "config:base",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "ignoreDeps": [
+    "@pnpm/assert-project",
+    "@pnpm/building.during-install",
+    "@pnpm/config.reader",
+    "@pnpm/constants",
+    "@pnpm/core-loggers",
+    "@pnpm/default-fetcher",
+    "@pnpm/cli.default-reporter",
+    "@pnpm/resolving.default-resolver",
+    "@pnpm/network.fetch",
+    "@pnpm/fetching.fetcher-base",
+    "@pnpm/filter-lockfile",
+    "@pnpm/fetching.git-fetcher",
+    "@pnpm/resolving.git-resolver",
+    "@pnpm/installing.deps-restorer",
+    "@pnpm/exec.lifecycle",
+    "@pnpm/deps.inspection.list",
+    "@pnpm/resolving.local-resolver",
+    "@pnpm/lockfile-file",
+    "@pnpm/lockfile-types",
+    "@pnpm/lockfile.utils",
+    "@pnpm/logger",
+    "@pnpm/installing.linking.modules-cleaner",
+    "@pnpm/installing.modules-yaml",
+    "@pnpm/npm-registry-agent",
+    "@pnpm/resolving.npm-resolver",
+    "@pnpm/deps.inspection.outdated",
+    "@pnpm/config.package-is-installable",
+    "@pnpm/installing.package-requester",
+    "@pnpm/store.controller",
+    "@pnpm/pkgid-to-filename",
+    "@pnpm/lockfile.pruner",
+    "@pnpm/installing.read-projects-context",
+    "@pnpm/workspace.project-manifest-reader",
+    "@pnpm/fs.read-modules-dir",
+    "@pnpm/pkg-manifest.reader",
+    "@pnpm/installing.deps-resolver",
+    "@pnpm/resolving.resolver-base",
+    "@pnpm/server",
+    "@pnpm/installing.linking.hoist",
+    "@pnpm/store.controller-types",
+    "@pnpm/store.path",
+    "@pnpm/fs.symlink-dependency",
+    "@pnpm/fetching.tarball-fetcher",
+    "@pnpm/resolving.tarball-resolver",
+    "@pnpm/types",
+    "@pnpm/utils",
+    "@pnpm/workspace.project-manifest-writer",
+    "tree-builder",
+    "@pnpm/deps.path",
+    "fetch-from-npm-registry",
+    "find-packages",
+    "npm",
+    "pkgs-graph",
+    "remove-all-except-outer-links",
+    "@pnpm/installing.deps-installer",
+    "ts-node",
+    "@types/ramda",
+    "@types/table"
+  ],
+  "ignorePaths": [
+    "fixtures",
+    "test/",
+    "packages/tree-builder/fixtures",
+    "packages/tree-builder/fixtureWithLinks",
+    "packages/tree-builder/example",
+    "packages/list/test/",
+    "packages/list/example/"
+  ],
+  "packageRules": [
+    {
+      "packageNames": ["@types/ramda"],
+      "allowedVersions": "0.25.34"
+    },
+    {
+      "packageNames": ["agentkeepalive"],
+      "allowedVersions": "4.0.0"
+    },
+    {
+      "packageNames": ["graceful-fs"],
+      "allowedVersions": "4.2.1"
+    },
+    {
+      "packageNames": ["https-proxy-agent"],
+      "allowedVersions": "2.2.1"
+    },
+    {
+      "packageNames": ["uuid"],
+      "allowedVersions": "^3.4.0"
+    },
+    {
+      "packageNames": ["p-queue"],
+      "allowedVersions": "^6.6.2"
+    },
+    {
+      "packageNames": ["unique-string"],
+      "allowedVersions": "^2.0.0"
+    },
+    {
+      "packageNames": ["normalize-newline"],
+      "allowedVersions": "^3.0.0"
+    },
+    {
+      "packageNames": ["p-defer"],
+      "allowedVersions": "^3.0.0"
+    },
+    {
+      "packageNames": ["escape-string-regexp"],
+      "allowedVersions": "^4.0.0"
+    },
+    {
+      "packageNames": ["sort-keys"],
+      "allowedVersions": "^4.2.0"
+    },
+    {
+      "packageNames": ["strip-bom"],
+      "allowedVersions": "^4.0.0"
+    }
+  ],
+  "pinVersions": false,
+  "schedule": [
+    "on Friday",
+    "every weekend"
+  ]
+}

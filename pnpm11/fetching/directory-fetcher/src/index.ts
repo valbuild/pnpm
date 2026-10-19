@@ -1,0 +1,216 @@
+import { promises as fs, type Stats } from 'node:fs'
+import path from 'node:path'
+
+import { pkgRequiresBuild } from '@pnpm/building.pkg-requires-build'
+import { isError, PnpmError } from '@pnpm/error'
+import type {
+  DirectoryFetcher,
+  DirectoryFetcherOptions,
+  LocalDirPackageImportMethod,
+} from '@pnpm/fetching.fetcher-base'
+import { packlist } from '@pnpm/fs.packlist'
+import { logger } from '@pnpm/logger'
+import type { FilesMap } from '@pnpm/store.cafs-types'
+import type { DependencyManifest } from '@pnpm/types'
+import { safeReadParentPublishManifest, safeReadProjectManifestOnly } from '@pnpm/workspace.project-manifest-reader'
+
+const directoryFetcherLogger = logger('directory-fetcher')
+
+export interface CreateDirectoryFetcherOptions {
+  includeOnlyPackageFiles?: boolean
+  localDirPackageImportMethod?: LocalDirPackageImportMethod
+  resolveSymlinks?: boolean
+}
+
+export function createDirectoryFetcher (
+  fetcherOpts?: CreateDirectoryFetcherOptions
+): { directory: DirectoryFetcher } {
+  const packageImportMethod = fetcherOpts?.localDirPackageImportMethod ?? 'hardlink'
+  const directoryFetcher: DirectoryFetcher = async (cafs, resolution, opts) => {
+    // Use path.resolve so absolute directories (e.g. cross-drive Windows paths
+    // stored by `file:` deps) are respected instead of being concatenated
+    // onto lockfileDir.
+    const dir = path.resolve(opts.lockfileDir, resolution.directory)
+    // An injected dependency whose packed content is the output of its own
+    // lifecycle scripts (a project with `publishConfig.directory` built by
+    // `prepare`) has no source directory on a fresh install: the scripts run
+    // after linking, and the built output is imported afterwards. Inject an
+    // empty copy so the install can proceed instead of failing on the
+    // not-yet-built directory. Any other missing directory still fails.
+    if (!await dirExists(dir)) {
+      const manifest = await safeReadParentPublishManifest(dir) as DependencyManifest | null
+      if (manifest != null) {
+        return {
+          local: true,
+          filesMap: new Map(),
+          packageImportMethod,
+          manifest,
+          requiresBuild: false,
+          sourceExists: false,
+        }
+      }
+    }
+    return {
+      ...await fetchFromDir(dir, fetcherOpts ?? {}),
+      sourceExists: true,
+    }
+  }
+
+  return {
+    directory: directoryFetcher,
+  }
+}
+
+export type FetchFromDirOptions = Omit<DirectoryFetcherOptions, 'lockfileDir'> & CreateDirectoryFetcherOptions
+
+async function dirExists (dir: string): Promise<boolean> {
+  try {
+    await fs.stat(dir)
+    return true
+  } catch (err: unknown) {
+    if (isError(err) && 'code' in err && err.code === 'ENOENT') return false
+    throw err
+  }
+}
+
+export interface FetchResult {
+  local: true
+  filesMap: FilesMap
+  filesStats?: Record<string, Stats | null>
+  packageImportMethod: LocalDirPackageImportMethod
+  manifest: DependencyManifest
+  requiresBuild: boolean
+}
+
+/**
+ * The files `fetchFromDir` lists, without reading the directory's manifest
+ * unless packlist mode needs it. For a caller that only compares listings and
+ * must not fail on a `package.json` another process is still writing.
+ */
+export async function listFilesFromDir (
+  dir: string,
+  opts: FetchFromDirOptions
+): Promise<Pick<FetchResult, 'filesMap' | 'filesStats'>> {
+  if (opts.includeOnlyPackageFiles) {
+    const files = await packlist(dir)
+    return { filesMap: new Map<string, string>(files.map((file) => [file, path.join(dir, file)])) }
+  }
+  return _fetchAllFilesFromDir(await createReadFileStat(dir, opts), dir)
+}
+
+export async function fetchFromDir (dir: string, opts: FetchFromDirOptions): Promise<FetchResult> {
+  const packageImportMethod = opts.localDirPackageImportMethod ?? 'hardlink'
+  const { filesMap, filesStats } = await listFilesFromDir(dir, opts)
+  // In a regular pnpm workspace it will probably never happen that a dependency has no package.json file.
+  // Safe read was added to support the Bit workspace in which the components have no package.json files.
+  // Related PR in Bit: https://github.com/teambit/bit/pull/5251
+  const manifest = await safeReadProjectManifestOnly(dir) as DependencyManifest ?? undefined
+  const requiresBuild = pkgRequiresBuild(manifest, filesMap)
+  return {
+    local: true,
+    filesMap,
+    filesStats,
+    packageImportMethod,
+    manifest,
+    requiresBuild,
+  }
+}
+
+async function createReadFileStat (dir: string, opts: CreateDirectoryFetcherOptions): Promise<ReadFileStat> {
+  const readStat = opts.resolveSymlinks === true ? realFileStat : fileStat
+  if (opts.includeOnlyPackageFiles !== false) return readStat
+  const root = await fs.realpath(dir)
+  return async (filePath) => {
+    const result = await readStat(filePath)
+    if (result == null) return null
+    if (!(await fs.lstat(filePath)).isSymbolicLink()) return result
+    const realPath = await fs.realpath(filePath)
+    const relative = path.relative(root, realPath)
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new PnpmError('INVALID_PATH', `Path "${filePath}" is outside the package directory "${dir}"`)
+    }
+    return result
+  }
+}
+
+async function _fetchAllFilesFromDir (
+  readFileStat: ReadFileStat,
+  dir: string,
+  relativeDir = ''
+): Promise<Pick<FetchResult, 'filesMap' | 'filesStats'>> {
+  const filesMap: FilesMap = new Map()
+  const filesStats: Record<string, Stats | null> = {}
+  const files = await fs.readdir(dir)
+  await Promise.all(files
+    .filter((file) => file !== 'node_modules')
+    .map((file) => handleDirEntry(readFileStat, dir, file, relativeDir, filesMap, filesStats))
+  )
+  return { filesMap, filesStats }
+}
+
+async function handleDirEntry (
+  readFileStat: ReadFileStat,
+  dir: string,
+  file: string,
+  relativeDir: string,
+  filesMap: FilesMap,
+  filesStats: Record<string, Stats | null>
+): Promise<void> {
+  const fileStatResult = await readFileStat(path.join(dir, file))
+  if (!fileStatResult) return
+  const { filePath, stat } = fileStatResult
+  const relativeSubdir = `${relativeDir}${relativeDir ? '/' : ''}${file}`
+  if (stat.isDirectory()) {
+    const subFetchResult = await _fetchAllFilesFromDir(readFileStat, filePath, relativeSubdir)
+    for (const [key, value] of subFetchResult.filesMap) {
+      filesMap.set(key, value)
+    }
+    Object.assign(filesStats, subFetchResult.filesStats)
+  } else {
+    filesMap.set(relativeSubdir, filePath)
+    filesStats[relativeSubdir] = fileStatResult.stat
+  }
+}
+
+interface FileStatResult {
+  filePath: string
+  stat: Stats
+}
+
+type ReadFileStat = (filePath: string) => Promise<FileStatResult | null>
+
+async function realFileStat (filePath: string): Promise<FileStatResult | null> {
+  let stat = await fs.lstat(filePath)
+  if (!stat.isSymbolicLink()) {
+    return { filePath, stat }
+  }
+  try {
+    filePath = await fs.realpath(filePath)
+    stat = await fs.stat(filePath)
+    return { filePath, stat }
+  } catch (err: unknown) {
+    // Broken symlinks are skipped
+    if (isError(err) && 'code' in err && err.code === 'ENOENT') {
+      directoryFetcherLogger.debug({ brokenSymlink: filePath })
+      return null
+    }
+    throw err
+  }
+}
+
+async function fileStat (filePath: string): Promise<FileStatResult | null> {
+  try {
+    return {
+      filePath,
+      stat: await fs.stat(filePath),
+    }
+  } catch (err: unknown) {
+    // Broken symlinks are skipped
+    if (isError(err) && 'code' in err && err.code === 'ENOENT') {
+      directoryFetcherLogger.debug({ brokenSymlink: filePath })
+      return null
+    }
+    throw err
+  }
+}
+

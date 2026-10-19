@@ -1,0 +1,354 @@
+pub use redact_url::redact_url_credentials;
+
+mod redact_url;
+#[cfg(not(target_family = "wasm"))]
+mod response;
+
+use derive_more::{Display, Error, From};
+
+#[derive(Debug, Display, Error, From)]
+#[non_exhaustive]
+pub enum RegistryError {
+    #[display("Upstream request to {url} failed: {source}")]
+    #[cfg(not(target_family = "wasm"))]
+    Upstream {
+        url: String,
+        #[error(source)]
+        source: reqwest::Error,
+    },
+
+    #[display("Upstream response body from {url} failed: {source}")]
+    UpstreamBody {
+        url: String,
+        #[error(source)]
+        source: std::io::Error,
+    },
+
+    #[display("Upstream returned status {status} for {url}")]
+    UpstreamStatus {
+        url: String,
+        status: u16,
+        #[error(not(source))]
+        body: String,
+    },
+
+    #[display("Invalid response from upstream {url}: {reason}")]
+    #[from(skip)]
+    UpstreamResponse {
+        #[error(not(source))]
+        url: String,
+        reason: String,
+    },
+
+    /// The upstream's circuit breaker is open: it reached `max_fails`
+    /// consecutive failures and is still inside its `fail_timeout`
+    /// cooldown, so pnpr short-circuits the request instead of hammering
+    /// a known-down upstream. The packument path turns this into a
+    /// stale-cache fallback; with nothing cached it surfaces as 503.
+    #[display("Upstream {upstream} is temporarily unavailable (circuit open)")]
+    #[from(skip)]
+    UpstreamUnavailable {
+        #[error(not(source))]
+        upstream: String,
+    },
+
+    #[display("EINTEGRITY: tarball {filename:?} for package {package:?}: {reason}")]
+    #[from(skip)]
+    TarballIntegrity {
+        #[error(not(source))]
+        package: String,
+        filename: String,
+        reason: String,
+    },
+
+    #[display("Package name {name:?} is not a valid npm package name")]
+    InvalidPackageName {
+        #[error(not(source))]
+        name: String,
+    },
+
+    #[display("Package name {name:?} is not valid for {ecosystem}: {reason}")]
+    InvalidEcosystemPackageName {
+        #[error(not(source))]
+        name: String,
+        #[error(not(source))]
+        ecosystem: String,
+        #[error(not(source))]
+        reason: String,
+    },
+
+    #[display("Tarball filename {filename:?} is not valid for package {package:?}")]
+    InvalidTarballName {
+        #[error(not(source))]
+        package: String,
+        filename: String,
+    },
+
+    /// The YAML config could not be parsed. Startup-only — this never
+    /// surfaces over HTTP, but `Config` parsing shares this error type.
+    #[display("Invalid config: {reason}")]
+    #[from(skip)]
+    InvalidConfig {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// Authentication is required for the requested resource but
+    /// the caller supplied no credentials (or invalid ones). Maps
+    /// to 401 to match npm/verdaccio.
+    #[display("Authentication required for {resource}")]
+    #[from(skip)]
+    Unauthenticated {
+        #[error(not(source))]
+        resource: String,
+    },
+
+    /// Credentials were supplied but the caller isn't allowed to
+    /// touch this resource. Maps to 403.
+    #[display("{user:?} is not allowed to {action} {resource}")]
+    #[from(skip)]
+    Forbidden {
+        #[error(not(source))]
+        user: String,
+        action: &'static str,
+        resource: String,
+    },
+
+    /// A team mutation (create/destroy/add/rm) hit the npm team API on a
+    /// registry whose teams are declared in the configuration. Maps to 403.
+    #[display(
+        "Teams on this registry are declared in the pnpr configuration; to {action}, ask the \
+         registry operator to update the config"
+    )]
+    #[from(skip)]
+    TeamsConfigManaged { action: &'static str },
+
+    /// A conditional write whose `If-Match` names a version the resource no
+    /// longer has. Maps to 412.
+    #[display("{resource} changed since version {expected}; read it again and repeat the change")]
+    #[from(skip)]
+    PreconditionFailed {
+        #[error(not(source))]
+        resource: String,
+        expected: String,
+    },
+
+    /// A rules edit hit the admin API on a registry whose rules are declared
+    /// in the configuration. Maps to 403.
+    #[display(
+        "The package rules of this registry are declared in the pnpr configuration; to change \
+         them, ask the registry operator to update the config"
+    )]
+    #[from(skip)]
+    RulesConfigManaged,
+
+    /// An admin edit that the current state refuses. Maps to 409.
+    #[from(skip)]
+    AdminConflict {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// Tarball payload from a publish couldn't be decoded — bad
+    /// base64, length mismatch, or integrity mismatch.
+    #[display("Invalid attachment {filename:?}: {reason}")]
+    #[from(skip)]
+    InvalidAttachment {
+        #[error(not(source))]
+        filename: String,
+        reason: String,
+    },
+
+    /// Generic client-side error during a write operation —
+    /// missing/invalid JSON body field, etc. Maps to 400.
+    #[display("Bad request: {reason}")]
+    #[from(skip)]
+    BadRequest {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// Nothing is served at the addressed route: an unknown package,
+    /// registry, or revision, or a private one masked as absent so the
+    /// 404 cannot be used to probe for its existence. Carries no detail
+    /// for that reason.
+    #[display("Not Found")]
+    NotFound,
+
+    /// A publish targeted a `name@version` that is already hosted.
+    /// Published versions are immutable; npm and verdaccio both answer a
+    /// re-publish with 409 Conflict.
+    #[display("Cannot publish over the previously published version {package}@{version}")]
+    #[from(skip)]
+    VersionAlreadyPublished {
+        #[error(not(source))]
+        package: String,
+        #[error(not(source))]
+        version: String,
+    },
+
+    /// A publish targeted an artifact slot that already holds different bytes.
+    ///
+    /// One input key and one set of compatibility constraints admit one
+    /// artifact, for the same reason a `name@version` admits one tarball: a
+    /// consumer that resolved it once must not be handed different bytes
+    /// later. Replacing a claimed slot is an operator action against the
+    /// store, not something a publishing credential can do — a stolen one
+    /// would otherwise be able to swap an artifact for a dependency nobody
+    /// has looked at in a year.
+    #[display("Cannot publish over the artifact already published for this input key and platform")]
+    #[from(skip)]
+    ArtifactAlreadyPublished {
+        #[error(not(source))]
+        owner: String,
+        #[error(not(source))]
+        entry: String,
+    },
+
+    /// A publish transaction committed, but another writer already owned
+    /// what one of its packages tried to publish, so that package's entry
+    /// was left out of the document rather than pointed at bytes that are
+    /// not the ones it uploaded.
+    #[display("Publish transaction could not record: {packages}")]
+    #[from(skip)]
+    PublishNotRecorded {
+        #[error(not(source))]
+        packages: String,
+    },
+
+    #[display("Upload {id:?} changed; query its offset before retrying")]
+    #[from(skip)]
+    BlobUploadConflict {
+        #[error(not(source))]
+        id: String,
+    },
+
+    #[display("Hosted document for package {package:?} changed while writing")]
+    #[from(skip)]
+    DocumentWriteConflict {
+        #[error(not(source))]
+        package: String,
+    },
+
+    /// Another request is already approving this staged publish. A staged
+    /// record is approved exactly once: the approving request claims it with
+    /// a conditional write, and a second one is refused rather than
+    /// publishing the held document twice.
+    #[display("Staged publish {stage_id:?} is already being approved")]
+    #[from(skip)]
+    StagedApprovalInFlight {
+        #[error(not(source))]
+        stage_id: String,
+    },
+
+    #[display("Hosted revision digest already has the maximum of {limit} references")]
+    #[from(skip)]
+    RevisionReferenceLimit { limit: usize },
+
+    #[display("Hosted revision reference index for digest {digest:?} changed while writing")]
+    #[from(skip)]
+    RevisionReferenceWriteConflict {
+        #[error(not(source))]
+        digest: String,
+    },
+
+    #[display(
+        "Package {package}@{version} is listed in the local OSV database as vulnerable ({advisories})"
+    )]
+    #[from(skip)]
+    OsvVulnerability {
+        #[error(not(source))]
+        package: String,
+        #[error(not(source))]
+        version: String,
+        #[error(not(source))]
+        advisories: String,
+    },
+
+    /// New-user registration is off: `auth.htpasswd.max_users` is
+    /// unset (the secure default) or set to `-1`. Returned for adduser
+    /// on a username that doesn't already exist; existing-user logins
+    /// are unaffected.
+    #[display(
+        "New user registration is disabled. Set auth.htpasswd.max_users to a positive number to allow sign-ups"
+    )]
+    RegistrationDisabled,
+
+    /// `auth.htpasswd.max_users: N` cap reached. Returned for
+    /// adduser on a username that doesn't already exist.
+    #[display("Maximum number of users ({max}) reached")]
+    #[from(skip)]
+    TooManyUsers { max: u64 },
+
+    #[display("Internal error: {reason}")]
+    #[from(skip)]
+    Internal {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// The htpasswd file on disk couldn't be parsed at startup.
+    /// Surfaced as a startup-time error rather than a silent empty
+    /// store so a corrupted file can't quietly lock every existing
+    /// user out.
+    #[display("Invalid htpasswd file {path}: {reason}")]
+    #[from(skip)]
+    InvalidHtpasswdFile {
+        #[error(not(source))]
+        path: String,
+        reason: String,
+    },
+
+    /// Bcrypt hash/verify failure. Operational error, not user-facing.
+    #[display("Bcrypt failure: {_0}")]
+    #[cfg(not(target_family = "wasm"))]
+    Bcrypt(bcrypt::BcryptError),
+
+    /// SQLite-backed token store failure.
+    #[display("Token database error: {_0}")]
+    #[cfg(not(target_family = "wasm"))]
+    Sqlite(rusqlite::Error),
+
+    /// Networked-SQLite (libsql / Turso) auth backend failure.
+    #[cfg(feature = "backend-libsql")]
+    #[display("Auth database error: {_0}")]
+    Libsql(libsql::Error),
+
+    /// SQL auth backend failure.
+    #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
+    #[display("Auth database error: {_0}")]
+    Sqlx(sqlx::Error),
+
+    /// SQL auth backend operation timed out.
+    #[cfg(any(
+        feature = "backend-libsql",
+        feature = "backend-postgres",
+        feature = "backend-mysql"
+    ))]
+    #[display("Auth database timeout")]
+    AuthDatabaseTimeout,
+
+    /// A blocking task spawned for bcrypt or `SQLite` work panicked
+    /// or was cancelled. Treat as an internal server error.
+    #[display("Background task failed: {_0}")]
+    #[cfg(not(target_family = "wasm"))]
+    JoinError(tokio::task::JoinError),
+
+    #[display("I/O error: {_0}")]
+    Io(std::io::Error),
+
+    /// Object-store (S3 / R2 / S3-compatible) backend failure on the
+    /// hosted store.
+    #[display("Object store error: {_0}")]
+    #[cfg(not(target_family = "wasm"))]
+    ObjectStore(object_store::Error),
+
+    #[display("JSON error: {_0}")]
+    #[cfg(not(target_family = "wasm"))]
+    Json(serde_json::Error),
+}
+
+pub type Result<Value, Error = RegistryError> = std::result::Result<Value, Error>;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;
